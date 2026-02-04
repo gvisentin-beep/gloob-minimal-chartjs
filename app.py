@@ -13,62 +13,66 @@ FILES = {
     "btc": DATA_DIR / "btc.csv",
 }
 
-# Pesi "Pigro" (modifica qui se vuoi)
 WEIGHTS = {"ls80": 0.80, "gold": 0.10, "btc": 0.10}
 
 
 def load_series(asset: str) -> pd.Series:
     """
-    Carica un CSV separato da ';' e restituisce una serie prezzi con indice datetime.
-    Gestisce:
-    - btc.csv: Data;Close;;;;;
-    - gold/ls80: Date;Close
+    Carica un CSV con separatore ';' e prende le prime 2 colonne:
+    - data
+    - close
+    Gestisce date tipo "25/01/2026" e "25.01.2026"
     """
-    path = FILES[asset]
+    path = FILES.get(asset)
+    if path is None:
+        raise ValueError(f"Asset non valido: {asset}")
+
     if not path.exists():
         raise FileNotFoundError(f"File non trovato: {path}")
 
-    # Legge solo le prime 2 colonne (le altre in btc sono vuote)
     df = pd.read_csv(path, sep=";", usecols=[0, 1], engine="python")
-
-    # Normalizza nomi colonne
     df.columns = ["date", "close"]
 
-    # Pulisce e converte
+    # pulizia date
     df["date"] = (
         df["date"]
         .astype(str)
         .str.strip()
-        .str.replace(".", "/", regex=False)  # BTC usa i punti
+        .str.replace(".", "/", regex=False)
     )
     df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+
+    # pulizia prezzi
+    df["close"] = (
+        df["close"]
+        .astype(str)
+        .str.strip()
+        .str.replace(",", ".", regex=False)
+    )
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
     df = df.dropna(subset=["date", "close"]).sort_values("date")
-    s = df.set_index("date")["close"]
-    s.name = asset
+    s = df.set_index("date")["close"].astype(float)
     return s
 
 
-def to_frequency(s: pd.Series, freq: str) -> pd.Series:
+def downsample(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     """
-    freq:
-      - "daily"   = serie giornaliera (così com'è)
-      - "monthly" = ultimo valore di ogni mese (più leggero per Chart.js)
+    mode:
+      - daily (default)
+      - weekly
+      - monthly
     """
-    if freq == "daily":
-        return s
-    # monthly: ultimo valore del mese
-    return s.resample("M").last().dropna()
+    mode = (mode or "daily").lower()
 
+    if mode == "daily":
+        return df
+    if mode == "weekly":
+        return df.resample("W-FRI").last().dropna()
+    if mode == "monthly":
+        return df.resample("M").last().dropna()
 
-def series_to_payload(s: pd.Series, monthly_labels: bool) -> dict:
-    if monthly_labels:
-        labels = [d.strftime("%Y-%m") for d in s.index]
-    else:
-        labels = [d.strftime("%Y-%m-%d") for d in s.index]
-    values = [float(v) for v in s.values]
-    return {"labels": labels, "values": values}
+    return df
 
 
 @app.route("/")
@@ -76,46 +80,62 @@ def index():
     return render_template("index.html")
 
 
+# ENDPOINT VECCHIO (debug) - lascia pure, comodo
 @app.route("/api/data")
 def api_data():
-    asset = request.args.get("asset", "portfolio").lower()
-    freq = request.args.get("freq", "monthly").lower()
+    asset = request.args.get("asset", "ls80").lower()
+    s = load_series(asset)
 
-    if freq not in ("monthly", "daily"):
-        return jsonify({"error": "freq deve essere 'monthly' o 'daily'"}), 400
+    # riduci un po' i punti (mensile) per leggibilità sul browser
+    mode = request.args.get("freq", "monthly")
+    df = downsample(s.to_frame("v"), mode)
 
-    try:
-        if asset in ("ls80", "gold", "btc"):
-            s = load_series(asset)
-            s = to_frequency(s, freq)
-            return jsonify(series_to_payload(s, monthly_labels=(freq == "monthly")))
+    labels = [d.strftime("%Y-%m") for d in df.index]
+    values = df["v"].round(6).tolist()
 
-        if asset == "portfolio":
-            s_ls80 = load_series("ls80")
-            s_gold = load_series("gold")
-            s_btc = load_series("btc")
+    return jsonify({"asset": asset, "labels": labels, "values": values})
 
-            # Allinea sulle date comuni (inner join)
-            df = pd.concat([s_ls80, s_gold, s_btc], axis=1).dropna()
 
-            # Indice 100 al primo valore: portfolio = somma pesata dei prezzi normalizzati
-            base = df.iloc[0]
-            norm = df / base * 100.0
-            port = (
-                norm["ls80"] * WEIGHTS["ls80"]
-                + norm["gold"] * WEIGHTS["gold"]
-                + norm["btc"] * WEIGHTS["btc"]
-            )
-            port.name = "portfolio"
+# NUOVO ENDPOINT: tutto pronto per 2 grafici (B sopra, C sotto)
+@app.route("/api/combined")
+def api_combined():
+    # daily/weekly/monthly
+    mode = request.args.get("freq", "daily")
 
-            port = to_frequency(port, freq)
+    s_ls80 = load_series("ls80")
+    s_gold = load_series("gold")
+    s_btc = load_series("btc")
 
-            return jsonify(series_to_payload(port, monthly_labels=(freq == "monthly")))
+    df = pd.concat(
+        {"ls80": s_ls80, "gold": s_gold, "btc": s_btc},
+        axis=1,
+        join="inner",
+    ).dropna()
 
-        return jsonify({"error": "asset deve essere ls80, gold, btc, oppure portfolio"}), 400
+    df = df.sort_index()
+    df = downsample(df, mode)
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # normalizza tutti a 100 alla prima data comune
+    base = df.iloc[0]
+    df_norm = (df / base) * 100.0
+
+    # portafoglio (B)
+    w = pd.Series(WEIGHTS)
+    portfolio = df_norm.mul(w, axis=1).sum(axis=1)
+
+    labels = [d.strftime("%Y-%m-%d") for d in df_norm.index]
+
+    return jsonify({
+        "labels": labels,
+        "portfolio": portfolio.round(6).tolist(),
+        "ls80": df_norm["ls80"].round(6).tolist(),
+        "gold": df_norm["gold"].round(6).tolist(),
+        "btc": df_norm["btc"].round(6).tolist(),
+        "base_date": df_norm.index[0].strftime("%Y-%m-%d"),
+        "weights": WEIGHTS,
+        "freq": mode,
+        "points": int(len(labels)),
+    })
 
 
 if __name__ == "__main__":
