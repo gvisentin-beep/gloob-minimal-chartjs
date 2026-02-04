@@ -2,55 +2,106 @@
 <html lang="it">
 <head>
   <meta charset="UTF-8" />
-  <title>Gloob — Test grafico (Chart.js)</title>
-
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gloob — Test grafici (Chart.js)</title>
 
   <!-- Chart.js (OBBLIGATORIO, prima di app.js) -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
   <style>
     body {
-      font-family: system-ui, -apple-system, BlinkMacSystemFont,
-                   "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell,
-                   "Helvetica Neue", Arial, sans-serif;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
       background: #f6f7f9;
       margin: 0;
-      padding: 32px;
+      padding: 24px;
     }
 
-    h1 {
-      margin-bottom: 6px;
-    }
+    h1 { margin: 0 0 6px 0; }
+    #status { color: #666; margin-bottom: 18px; }
 
-    #status {
-      color: #666;
-      margin-bottom: 16px;
-    }
-
-    .chart-wrapper {
+    .block {
       width: 100%;
-      max-width: 900px;
-      height: 420px;
+      max-width: 1100px;
+      margin: 0 auto 22px auto;
+    }
+
+    .card {
       background: #fff;
+      border-radius: 10px;
+      padding: 14px 14px 8px 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+    }
+
+    .card h2 {
+      margin: 0 0 10px 0;
+      font-size: 16px;
+      color: #222;
+      font-weight: 650;
+    }
+
+    .chart-box {
+      position: relative;
+      height: 420px;
+      width: 100%;
+    }
+
+    .note {
+      font-size: 13px;
+      color: #666;
+      margin-top: 8px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+
+    select {
+      padding: 6px 8px;
       border-radius: 8px;
-      padding: 12px;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+      border: 1px solid #ddd;
+      background: #fff;
     }
   </style>
 </head>
 
 <body>
+  <div class="block">
+    <h1>Gloob — Test grafici (Chart.js)</h1>
+    <div id="status">In attesa dei dati...</div>
 
-  <h1>Gloob — Test grafico (Chart.js)</h1>
-  <p id="status">In attesa dei dati…</p>
-
-  <div class="chart-wrapper">
-    <canvas id="portfolioChart"></canvas>
+    <div class="toolbar">
+      <label for="freq">Frequenza:</label>
+      <select id="freq">
+        <option value="daily" selected>Giornaliera</option>
+        <option value="weekly">Settimanale</option>
+        <option value="monthly">Mensile</option>
+      </select>
+    </div>
   </div>
 
-  <!-- IL TUO JS (QUESTO ERA IL PEZZO MANCANTE) -->
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <!-- GRAFICO B (SOPRA) -->
+  <div class="block card">
+    <h2>B) Portafoglio (normalizzato a 100)</h2>
+    <div class="chart-box">
+      <canvas id="chartB"></canvas>
+    </div>
+    <div class="note" id="noteB"></div>
+  </div>
 
+  <!-- GRAFICO C (SOTTO) -->
+  <div class="block card">
+    <h2>C) Componenti: LS80, Gold, BTC (ognuno a 100)</h2>
+    <div class="chart-box">
+      <canvas id="chartC"></canvas>
+    </div>
+    <div class="note" id="noteC"></div>
+  </div>
+
+  <script src="/static/app.js"></script>
 </body>
 </html>
