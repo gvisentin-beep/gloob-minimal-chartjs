@@ -1,121 +1,235 @@
-from flask import Flask, jsonify, request
-import pandas as pd
+from __future__ import annotations
+
+from flask import Flask, jsonify, render_template, request
 from pathlib import Path
+import pandas as pd
 
 app = Flask(__name__)
 
-DATA_DIR = Path("data")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+
+FILES = {
+    "ls80": DATA_DIR / "ls80.csv",
+    "gold": DATA_DIR / "gold.csv",
+    "btc": DATA_DIR / "btc.csv",
+}
+
+# Pesi del "Pigro" (modifica qui se vuoi)
+WEIGHTS = {"ls80": 0.80, "gold": 0.10, "btc": 0.10}
+
+# Frequenze pandas (robuste su versioni recenti)
+FREQ_MAP = {
+    "daily": "D",
+    "weekly": "W",
+    "month": "ME",
+    "monthly": "ME",
+    "quarter": "QE",
+    "quarterly": "QE",
+    "year": "YE",
+    "yearly": "YE",
+}
 
 
-# --------------------------------------------------
-# Utilities
-# --------------------------------------------------
-
-def _read_asset(asset: str) -> pd.DataFrame:
-    path = DATA_DIR / f"{asset}.csv"
-
+def _safe_read_csv(path: Path) -> pd.DataFrame:
+    """
+    Legge CSV robustamente:
+    - prova autodetect separatore
+    - fallback su ';' e ','
+    - se finisce con 1 colonna, prova a splittare quella colonna
+    """
     if not path.exists():
-        raise ValueError(f"Asset '{asset}' non trovato")
+        raise FileNotFoundError(f"File non trovato: {path}")
 
-    df = pd.read_csv(path)
+    # 1) autodetect separatore (engine python)
+    try:
+        df = pd.read_csv(path, sep=None, engine="python")
+    except Exception:
+        df = pd.read_csv(path, sep=";", engine="python")
 
+    # 2) se ancora 1 colonna, prova fallback espliciti
     if df.shape[1] < 2:
-        raise ValueError(f"CSV {asset} deve avere almeno 2 colonne")
+        try:
+            df = pd.read_csv(path, sep=";")
+        except Exception:
+            df = pd.read_csv(path, sep=",")
 
-    df = df.iloc[:, :2]
-    df.columns = ["date", "value"]
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-
-    df = df.dropna()
-    df = df.sort_values("date")
-    df = df.set_index("date")
+    # 3) se ancora 1 colonna, prova split manuale
+    if df.shape[1] < 2 and df.shape[0] > 0:
+        col0 = df.columns[0]
+        s = df[col0].astype(str)
+        # prova split su ';' oppure ','
+        if s.str.contains(";").any():
+            parts = s.str.split(";", n=1, expand=True)
+            df = pd.DataFrame({"date": parts[0], "value": parts[1]})
+        elif s.str.contains(",").any():
+            parts = s.str.split(",", n=1, expand=True)
+            df = pd.DataFrame({"date": parts[0], "value": parts[1]})
 
     return df
 
 
-def _resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    if freq == "monthly":
-        rule = "ME"   # Month End (pandas 2.x)
-    elif freq == "daily":
-        rule = "D"
+def _pick_date_value_columns(df: pd.DataFrame) -> tuple[str, str]:
+    """
+    Sceglie colonna data e valore in modo tollerante.
+    """
+    cols = [c.strip() for c in df.columns]
+    df.columns = cols
+
+    # candidati "data"
+    date_candidates = [c for c in cols if c.lower() in ("date", "data", "datetime", "giorno")]
+    date_col = date_candidates[0] if date_candidates else cols[0]
+
+    # candidati "valore"
+    value_candidates = [c for c in cols if c.lower() in ("value", "valore", "close", "prezzo", "price", "nav")]
+    if value_candidates:
+        value_col = value_candidates[0]
     else:
-        raise ValueError("freq deve essere 'daily' o 'monthly'")
+        # cerca prima colonna numerica diversa dalla data
+        other_cols = [c for c in cols if c != date_col]
+        value_col = other_cols[0] if other_cols else cols[-1]
 
-    return df.resample(rule).last().dropna()
-
-
-def _normalize_100(df: pd.DataFrame) -> pd.Series:
-    base = df.iloc[0, 0]
-    return (df.iloc[:, 0] / base * 100).round(2)
+    return date_col, value_col
 
 
-# --------------------------------------------------
-# Routes
-# --------------------------------------------------
+def _read_asset(asset: str) -> pd.Series:
+    if asset not in FILES:
+        raise ValueError(f"Asset non valido: {asset}. Usa: {', '.join(FILES.keys())}")
+
+    df = _safe_read_csv(FILES[asset])
+
+    if df.shape[1] < 2:
+        raise ValueError(f"CSV {asset} deve avere almeno 2 colonne (data, valore)")
+
+    date_col, value_col = _pick_date_value_columns(df)
+
+    out = df[[date_col, value_col]].copy()
+    out.columns = ["date", "value"]
+
+    # pulizia value: virgole, spazi, ecc.
+    out["value"] = (
+        out["value"]
+        .astype(str)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+
+    # parsing date (in Italia spesso day-first)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
+
+    out = out.dropna(subset=["date", "value"]).sort_values("date")
+    if out.empty:
+        raise ValueError(f"CSV {asset}: non trovo righe valide (data + valore)")
+
+    s = out.set_index("date")["value"]
+    # se ci sono date duplicate, prendi l’ultima
+    s = s[~s.index.duplicated(keep="last")]
+    return s
+
+
+def _resample(s: pd.Series, freq: str) -> pd.Series:
+    f = FREQ_MAP.get(freq.lower(), "ME")
+
+    # daily: non resamplare, ma normalizza (tieni l’ultima per giorno se serve)
+    if f == "D":
+        return s.resample("D").last().dropna()
+
+    # per ME/QE/YE ecc: prendi ultimo valore del periodo
+    return s.resample(f).last().dropna()
+
+
+def _normalize_100(s: pd.Series) -> pd.Series:
+    if s.empty:
+        return s
+    base = float(s.iloc[0])
+    if base == 0:
+        return s * 0.0
+    return (s / base) * 100.0
+
 
 @app.route("/")
-def index():
-    return "gloob-minimal-chartjs API is running"
+def home():
+    # se hai templates/index.html va bene così
+    try:
+        return render_template("index.html")
+    except Exception:
+        return "OK - service running"
 
 
 @app.route("/api/data")
 def api_data():
-    asset = request.args.get("asset")
-    freq = request.args.get("freq", "monthly")
-
-    if not asset:
-        return jsonify({"error": "asset mancante"}), 400
+    asset = request.args.get("asset", "ls80").lower()
+    freq = request.args.get("freq", "monthly").lower()
 
     try:
-        df = _read_asset(asset)
-        df = _resample(df, freq)
-        series = _normalize_100(df)
-
-        return jsonify({
-            "asset": asset,
-            "freq": freq,
-            "labels": series.index.strftime("%Y-%m").tolist(),
-            "values": series.tolist()
-        })
-
+        s = _resample(_read_asset(asset), freq)
+        idx = _normalize_100(s)
+        labels = [d.strftime("%Y-%m") for d in idx.index]
+        values = [round(float(v), 2) for v in idx.values]
+        return jsonify(
+            {
+                "asset": asset,
+                "freq": freq,
+                "base_date": idx.index[0].strftime("%Y-%m-%d") if len(idx) else None,
+                "points": len(values),
+                "labels": labels,
+                "values": values,
+            }
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/combined")
 def api_combined():
-    freq = request.args.get("freq", "monthly")
+    """
+    Ritorna due serie NORMALIZZATE a 100:
+    - "portfolio": Portafoglio (LS80 80% + Gold 10% + BTC 10%)
+    - "benchmark": LS80 (benchmark semplice)
+    """
+    freq = request.args.get("freq", "monthly").lower()
 
     try:
-        benchmark = _normalize_100(
-            _resample(_read_asset("ls80"), freq)
-        )
-        portfolio = _normalize_100(
-            _resample(_read_asset("portfolio"), freq)
+        s_ls80 = _resample(_read_asset("ls80"), freq)
+        s_gold = _resample(_read_asset("gold"), freq)
+        s_btc = _resample(_read_asset("btc"), freq)
+
+        df = pd.concat(
+            {"ls80": s_ls80, "gold": s_gold, "btc": s_btc},
+            axis=1,
+        ).dropna()
+
+        if df.empty:
+            return jsonify({"error": "Dati insufficienti (date comuni vuote)"}), 500
+
+        # portfolio: somma pesata dei livelli normalizzati (base 100)
+        ls80_n = _normalize_100(df["ls80"])
+        gold_n = _normalize_100(df["gold"])
+        btc_n = _normalize_100(df["btc"])
+
+        portfolio = (
+            ls80_n * WEIGHTS["ls80"]
+            + gold_n * WEIGHTS["gold"]
+            + btc_n * WEIGHTS["btc"]
         )
 
-        labels = benchmark.index.strftime("%Y-%m").tolist()
-
-        return jsonify({
-            "base_date": labels[0],
+        labels = [d.strftime("%Y-%m") for d in df.index]
+        out = {
+            "base_date": df.index[0].strftime("%Y-%m-%d"),
             "freq": freq,
+            "points": len(df.index),
             "labels": labels,
-            "points": len(labels),
             "series": {
-                "benchmark": benchmark.tolist(),
-                "portfolio": portfolio.tolist()
-            }
-        })
+                "benchmark": [round(float(v), 2) for v in ls80_n.values],
+                "portfolio": [round(float(v), 2) for v in portfolio.values],
+            },
+        }
+        return jsonify(out)
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# --------------------------------------------------
-# Render / Gunicorn entrypoint
-# --------------------------------------------------
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(debug=True)
