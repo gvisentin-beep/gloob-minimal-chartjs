@@ -10,97 +10,82 @@ DATA_DIR = BASE_DIR / "data"
 FILES = {
     "ls80": DATA_DIR / "ls80.csv",
     "gold": DATA_DIR / "gold.csv",
-    "btc": DATA_DIR / "btc.csv",
+    "btc":  DATA_DIR / "btc.csv",
 }
 
-# Pesi portafoglio "B" (modifica qui se vuoi)
+# Pesi del portafoglio "Pigro"
 WEIGHTS = {"ls80": 0.80, "gold": 0.10, "btc": 0.10}
 
 
-# --------- Helpers ---------
-def _pick_date_col(df: pd.DataFrame) -> str:
-    # prova nomi tipici
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if cl in ("date", "data", "datetime", "time"):
-            return c
-    # altrimenti prima colonna
-    return df.columns[0]
+def _pick_two_columns(df: pd.DataFrame, asset: str) -> pd.DataFrame:
+    """
+    Ritorna un DataFrame con colonne: ['date','value'].
+    - prende la prima colonna come data (se non trova una colonna esplicita)
+    - prende la prima colonna numerica come value (se non trova una colonna esplicita)
+    """
+    if df is None or df.shape[1] < 2:
+        raise ValueError(f"CSV {asset} deve avere almeno 2 colonne (data, valore)")
 
+    # normalizza nomi colonne
+    cols = [str(c).strip().lower() for c in df.columns]
+    df.columns = cols
 
-def _pick_value_col(df: pd.DataFrame, date_col: str) -> str:
-    # prova nomi tipici
-    candidates = [
-        "value", "valore", "close", "adj close", "adj_close", "price", "prezzo", "nav"
-    ]
-    cols = [c for c in df.columns if c != date_col]
-    for want in candidates:
-        for c in cols:
-            if str(c).strip().lower() == want:
-                return c
-    # altrimenti la prima colonna non-data
-    if len(cols) >= 1:
-        return cols[0]
-    raise ValueError("CSV deve avere almeno 2 colonne (data, valore)")
+    # prova a trovare la colonna data
+    date_candidates = [c for c in df.columns if c in ("date", "data", "datetime", "time")]
+    if date_candidates:
+        date_col = date_candidates[0]
+    else:
+        date_col = df.columns[0]
+
+    # prova a trovare la colonna valore
+    value_candidates = [c for c in df.columns if c in ("value", "valore", "close", "price", "prezzo", "adj close", "adj_close")]
+    if value_candidates:
+        value_col = value_candidates[0]
+    else:
+        # prima colonna numerica (escludendo la data)
+        tmp = df.copy()
+        for c in tmp.columns:
+            if c == date_col:
+                continue
+            tmp[c] = pd.to_numeric(tmp[c], errors="coerce")
+        numeric_cols = [c for c in tmp.columns if c != date_col and tmp[c].notna().any()]
+        if not numeric_cols:
+            raise ValueError(f"CSV {asset}: non trovo una colonna numerica per il valore.")
+        value_col = numeric_cols[0]
+
+    out = df[[date_col, value_col]].copy()
+    out.columns = ["date", "value"]
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce", utc=False)
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+
+    out = out.dropna(subset=["date", "value"]).sort_values("date")
+
+    if out.shape[0] < 2:
+        raise ValueError(f"CSV {asset}: dati insufficienti dopo la pulizia.")
+    return out
 
 
 def _read_asset(asset: str) -> pd.Series:
     if asset not in FILES:
-        raise ValueError(f"Asset non valido: {asset}")
+        raise ValueError(f"Asset sconosciuto: {asset}. Usa: {list(FILES.keys())}")
+
     path = FILES[asset]
     if not path.exists():
         raise FileNotFoundError(f"File mancante: {path}")
 
-    # lettura robusta (pandas spesso indovina; se separatore “;” va comunque)
-    df = pd.read_csv(path)
+    # Auto-detect separatore (funziona per ',' o ';' ecc.)
+    df = pd.read_csv(path, sep=None, engine="python")
 
-    if df.shape[1] < 2:
-        raise ValueError(f"CSV {asset} deve avere almeno 2 colonne (data, valore)")
-
-    date_col = _pick_date_col(df)
-    val_col = _pick_value_col(df, date_col)
-
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
-
-    df = df.dropna(subset=[date_col, val_col]).sort_values(date_col)
-
-    s = df.set_index(date_col)[val_col]
+    df = _pick_two_columns(df, asset)
+    s = pd.Series(df["value"].values, index=df["date"].values)
     s.index = pd.to_datetime(s.index)
-    s = s[~s.index.duplicated(keep="last")]
-    return s.dropna()
+    s = s.sort_index()
+    return s
 
 
-def _freq_to_rule(freq: str) -> str:
-    f = (freq or "monthly").strip().lower()
-
-    # accetta anche errori di digitazione tipo "monthl"
-    if f in ("d", "day", "daily", "giorno", "giornaliero"):
-        return "D"
-    if f in ("w", "week", "weekly", "sett", "settimanale"):
-        return "W-FRI"
-    if f in ("m", "mon", "month", "monthly", "mese", "mensile", "monthl"):
-        # Pandas nuovi: usare ME (month end) invece di M
-        return "ME"
-    if f in ("q", "quarter", "quarterly", "trimestre", "trimestrale"):
-        return "QE"
-    if f in ("y", "year", "yearly", "annuale", "anno"):
-        return "YE"
-
-    # fallback
-    return "ME"
-
-
-def _resample(s: pd.Series, freq: str) -> pd.Series:
-    rule = _freq_to_rule(freq)
-    if rule == "D":
-        out = s.asfreq("D").ffill()
-    else:
-        out = s.resample(rule).last()
-    return out.dropna()
-
-
-def _normalize_100(s: pd.Series) -> pd.Series:
+def _normalize_to_100(s: pd.Series) -> pd.Series:
+    s = s.dropna()
     if s.empty:
         return s
     base = float(s.iloc[0])
@@ -109,93 +94,97 @@ def _normalize_100(s: pd.Series) -> pd.Series:
     return (s / base) * 100.0
 
 
-def _to_payload(series: pd.Series, asset: str, freq: str) -> dict:
-    series = series.dropna()
-    labels = [d.strftime("%Y-%m") for d in series.index]  # per mensile, leggibile
-    values = [round(float(v), 2) for v in series.values]
-    base_date = series.index[0].strftime("%Y-%m-%d") if len(series) else None
-    return {
-        "asset": asset,
-        "freq": freq,
-        "base_date": base_date,
-        "points": len(values),
-        "labels": labels,
-        "values": values,
+def _map_freq(freq: str) -> str:
+    """
+    Supporta: daily, weekly, monthly, quarterly, yearly
+    Nota: per pandas moderni, fine mese = 'ME' (NON 'M').
+    """
+    f = (freq or "monthly").lower().strip()
+
+    # accetta typo comuni
+    if f in ("monthl", "mensile", "mese"):
+        f = "monthly"
+
+    mapping = {
+        "daily": "D",
+        "weekly": "W-FRI",
+        "monthly": "ME",      # month-end
+        "quarterly": "QE",    # quarter-end
+        "yearly": "YE",       # year-end
     }
+    return mapping.get(f, "ME")
 
 
-# --------- Routes ---------
+def _resample(s: pd.Series, freq: str) -> pd.Series:
+    rule = _map_freq(freq)
+    # last del periodo (fine periodo)
+    return s.resample(rule).last().dropna()
+
+
 @app.route("/")
-def index():
+def home():
     return render_template("index.html")
 
 
 @app.route("/api/data")
 def api_data():
-    asset = request.args.get("asset", "ls80").strip().lower()
-    freq = request.args.get("freq", "monthly").strip().lower()
+    asset = request.args.get("asset", "ls80").lower().strip()
+    freq = request.args.get("freq", "monthly").lower().strip()
 
     s = _read_asset(asset)
     s = _resample(s, freq)
-    s = _normalize_100(s)
+    idx = _normalize_to_100(s)
 
-    return jsonify(_to_payload(s, asset, freq))
+    labels = [pd.Timestamp(d).strftime("%Y-%m") for d in idx.index]
+    values = [round(float(v), 2) for v in idx.values]
+
+    return jsonify({
+        "asset": asset,
+        "freq": freq,
+        "base_date": pd.Timestamp(idx.index[0]).strftime("%Y-%m-%d"),
+        "points": len(values),
+        "labels": labels,
+        "values": values,
+    })
 
 
 @app.route("/api/combined")
 def api_combined():
     """
-    Ritorna due serie NORMALIZZATE a 100, allineate sulle stesse date:
-    - B: Portafoglio (LS80 80% + Gold 10% + BTC 10%)
-    - C: LS80 (benchmark semplice)
+    Ritorna 2 serie NORMALIZZATE a 100:
+      - portfolio: LS80 80% + Gold 10% + BTC 10%
+      - benchmark: LS80 (solo)
     """
-    freq = request.args.get("freq", "monthly").strip().lower()
+    freq = request.args.get("freq", "monthly").lower().strip()
 
-    s_ls80 = _normalize_100(_resample(_read_asset("ls80"), freq))
-    s_gold = _normalize_100(_resample(_read_asset("gold"), freq))
-    s_btc = _normalize_100(_resample(_read_asset("btc"), freq))
+    s_ls80 = _resample(_read_asset("ls80"), freq)
+    s_gold = _resample(_read_asset("gold"), freq)
+    s_btc  = _resample(_read_asset("btc"),  freq)
 
-    # Allinea sulle date comuni
-    df = pd.concat(
-        {"ls80": s_ls80, "gold": s_gold, "btc": s_btc},
-        axis=1
-    ).dropna()
+    df = pd.concat({"ls80": s_ls80, "gold": s_gold, "btc": s_btc}, axis=1).dropna()
 
-    # se non ci sono date comuni, evita crash
-    if df.empty:
-        return jsonify({
-            "freq": freq,
-            "base_date": None,
-            "points": 0,
-            "labels": [],
-            "portfolio": [],
-            "ls80": [],
-            "weights": WEIGHTS,
-        })
+    # Portfolio (somma pesata)
+    port = (df["ls80"] * WEIGHTS["ls80"] +
+            df["gold"] * WEIGHTS["gold"] +
+            df["btc"]  * WEIGHTS["btc"])
 
-    # Portafoglio "B" (somma pesata delle serie normalizzate)
-    b = (
-        df["ls80"] * WEIGHTS["ls80"]
-        + df["gold"] * WEIGHTS["gold"]
-        + df["btc"] * WEIGHTS["btc"]
-    )
+    port_idx = _normalize_to_100(port)
+    bench_idx = _normalize_to_100(df["ls80"])
 
-    # Benchmark "C" = LS80
-    c = df["ls80"]
-
-    labels = [d.strftime("%Y-%m") for d in df.index]
-    base_date = df.index[0].strftime("%Y-%m-%d")
+    labels = [pd.Timestamp(d).strftime("%Y-%m") for d in port_idx.index]
 
     return jsonify({
         "freq": freq,
-        "base_date": base_date,
-        "points": int(len(labels)),
+        "base_date": pd.Timestamp(port_idx.index[0]).strftime("%Y-%m-%d"),
+        "points": len(labels),
         "labels": labels,
-        "portfolio": [round(float(v), 2) for v in b.values],  # B
-        "ls80": [round(float(v), 2) for v in c.values],       # C
-        "weights": WEIGHTS,
+        "series": {
+            "portfolio": [round(float(v), 2) for v in port_idx.values],
+            "benchmark": [round(float(v), 2) for v in bench_idx.reindex(port_idx.index).values],
+        }
     })
 
 
+# Render/Gunicorn: usa "gunicorn app:app"
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=10000, debug=True)
