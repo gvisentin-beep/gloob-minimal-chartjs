@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import pandas as pd
 from flask import Flask, jsonify, request, send_from_directory
@@ -26,23 +26,62 @@ W_BTC = 0.05
 
 # --- Helpers ---------------------------------------------------------------
 
+def _read_text_first_line(path: Path) -> str:
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            return (f.readline() or "").strip()
+    except Exception:
+        return ""
+
+
 def _detect_and_read_csv(path: Path) -> pd.DataFrame:
     """
-    Legge CSV auto-detectando separatore (, o ;) e gestendo BOM/righe vuote.
+    Legge CSV in modo robusto:
+    - gestisce BOM
+    - gestisce riga iniziale "sep=;"
+    - prova separatori comuni se la lettura produce 1 sola colonna
     """
     if not path.exists():
         raise FileNotFoundError(f"File non trovato: {path}")
 
-    # sep=None + engine='python' => tenta autodetect separatore
-    df = pd.read_csv(
-        path,
-        sep=None,
-        engine="python",
-        encoding="utf-8-sig",
-        skip_blank_lines=True,
-    )
+    first = _read_text_first_line(path).lower()
+    skiprows = 1 if first.startswith("sep=") else 0
+
+    # 1) prova autodetect
+    try:
+        df = pd.read_csv(
+            path,
+            sep=None,
+            engine="python",
+            encoding="utf-8-sig",
+            skip_blank_lines=True,
+            skiprows=skiprows,
+        )
+    except Exception:
+        df = pd.DataFrame()
+
+    # Se df è vuoto o ha 1 sola colonna, prova separatori espliciti
+    seps_to_try = [";", ",", "\t", "|"]
+    if df is None or df.empty or df.shape[1] < 2:
+        for sep in seps_to_try:
+            try:
+                df_try = pd.read_csv(
+                    path,
+                    sep=sep,
+                    engine="python",
+                    encoding="utf-8-sig",
+                    skip_blank_lines=True,
+                    skiprows=skiprows,
+                )
+                if df_try is not None and (not df_try.empty) and df_try.shape[1] >= 2:
+                    df = df_try
+                    break
+            except Exception:
+                continue
+
     if df is None or df.empty:
         raise ValueError(f"CSV vuoto o illeggibile: {path.name}")
+
     return df
 
 
@@ -59,11 +98,16 @@ def _pick_date_value_columns(df: pd.DataFrame) -> Tuple[str, str]:
     """
     cols = list(df.columns)
 
-    date_candidates = {"date", "data", "datetime", "timestamp"}
-    value_candidates = {"value", "valore", "close", "prezzo", "price", "adj close", "adj_close", "last"}
+    if len(cols) < 2:
+        raise ValueError("Il CSV deve avere almeno 2 colonne (data, valore).")
 
-    date_col = None
-    value_col = None
+    date_candidates = {"date", "data", "datetime", "timestamp"}
+    value_candidates = {
+        "value", "valore", "close", "prezzo", "price", "adj close", "adj_close", "last"
+    }
+
+    date_col: Optional[str] = None
+    value_col: Optional[str] = None
 
     for c in cols:
         if c in date_candidates:
@@ -79,8 +123,6 @@ def _pick_date_value_columns(df: pd.DataFrame) -> Tuple[str, str]:
         return date_col, value_col
 
     # fallback: prime due colonne
-    if len(cols) < 2:
-        raise ValueError("Il CSV deve avere almeno 2 colonne (data, valore).")
     return cols[0], cols[1]
 
 
@@ -93,13 +135,14 @@ def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
     out["date"] = df[date_col]
     out["value"] = df[value_col]
 
-    # Date: gestisce dd/mm/yyyy (Italia) e vari formati
+    # Date: robusto per formati italiani
     out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
 
-    # Value: gestisce virgole decimali
+    # Value: gestisce virgole decimali, spazi, ecc.
     out["value"] = (
         out["value"]
         .astype(str)
+        .str.replace("\u00a0", "", regex=False)  # NBSP
         .str.replace(" ", "", regex=False)
         .str.replace(",", ".", regex=False)
     )
@@ -110,7 +153,6 @@ def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
         raise ValueError(f"CSV {asset} non contiene righe valide (data/valore).")
 
     s = out.set_index("date")["value"].astype(float)
-    # elimina duplicati data (tiene ultimo)
     s = s[~s.index.duplicated(keep="last")]
     return s
 
@@ -118,40 +160,22 @@ def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
 def _freq_to_pandas(freq: str) -> str:
     """
     Mappa frequenze “umane” a pandas offset.
-    Nota: per il mensile, pandas recente preferisce 'ME' al posto di 'M'.
+    Importante: mensile = 'ME' (non 'M').
     """
     f = (freq or "monthly").strip().lower()
 
     mapping = {
-        "daily": "D",
-        "day": "D",
-        "d": "D",
-        "weekly": "W-FRI",
-        "week": "W-FRI",
-        "w": "W-FRI",
-        "monthly": "ME",   # <-- importante
-        "month": "ME",
-        "m": "ME",         # <-- importante
-        "quarterly": "QE",
-        "quarter": "QE",
-        "q": "QE",
-        "yearly": "YE",
-        "year": "YE",
-        "y": "YE",
+        "daily": "D", "day": "D", "d": "D",
+        "weekly": "W-FRI", "week": "W-FRI", "w": "W-FRI",
+        "monthly": "ME", "month": "ME", "m": "ME",
+        "quarterly": "QE", "quarter": "QE", "q": "QE",
+        "yearly": "YE", "year": "YE", "y": "YE",
     }
-
-    # se l'utente passa già un offset pandas, gestiamo il caso 'M'
-    if f == "m":
-        return "ME"
-    if f == "M":
-        return "ME"
-
     return mapping.get(f, "ME")
 
 
 def _resample(s: pd.Series, freq: str) -> pd.Series:
     rule = _freq_to_pandas(freq)
-    # last() = ultimo valore del periodo
     return s.resample(rule).last().dropna()
 
 
@@ -175,13 +199,12 @@ def _read_asset(asset: str) -> pd.Series:
 
 
 def _series_to_payload(asset: str, s: pd.Series, freq: str) -> dict:
-    s = _resample(s, freq)
-    s = _normalize_100(s)
+    s = _normalize_100(_resample(s, freq))
 
     labels = [d.strftime("%Y-%m") for d in s.index.to_pydatetime()]
     values = [round(float(v), 4) for v in s.values]
-
     base_date = s.index[0].strftime("%Y-%m-%d") if not s.empty else None
+
     return {
         "asset": asset,
         "base_date": base_date,
@@ -196,7 +219,6 @@ def _series_to_payload(asset: str, s: pd.Series, freq: str) -> dict:
 
 @app.get("/")
 def root():
-    # Se hai una pagina in /static (es. index.html), servila
     static_index = BASE_DIR / "static" / "index.html"
     if static_index.exists():
         return send_from_directory(BASE_DIR / "static", "index.html")
@@ -226,20 +248,10 @@ def api_combined():
         gold = _normalize_100(_resample(s_gold, freq))
         btc = _normalize_100(_resample(s_btc, freq))
 
-        # allineo sulle date comuni
-        df = pd.concat(
-            {
-                "ls80": ls80,
-                "gold": gold,
-                "btc": btc,
-            },
-            axis=1,
-        ).dropna()
-
+        df = pd.concat({"ls80": ls80, "gold": gold, "btc": btc}, axis=1).dropna()
         if df.empty:
             raise ValueError("Dopo l’allineamento delle date comuni, non ci sono dati sufficienti.")
 
-        # Portfolio = somma pesata degli indici normalizzati a 100
         portfolio = (df["ls80"] * W_LS80) + (df["gold"] * W_GOLD) + (df["btc"] * W_BTC)
         benchmark = df["ls80"]
 
@@ -261,6 +273,5 @@ def api_combined():
 
 
 if __name__ == "__main__":
-    # locale
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
