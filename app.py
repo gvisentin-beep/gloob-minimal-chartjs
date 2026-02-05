@@ -5,13 +5,12 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import pandas as pd
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-STATIC_DIR = BASE_DIR / "static"
 
 ASSET_FILES: Dict[str, str] = {
     "ls80": "ls80.csv",
@@ -25,8 +24,10 @@ W_GOLD = 0.15
 W_BTC = 0.05
 
 
+# ------------------ CSV helpers ------------------
+
 def _detect_and_read_csv(path: Path) -> pd.DataFrame:
-    """Legge CSV auto-detectando separatore (, o ;) e gestendo BOM/righe vuote."""
+    """Legge CSV con autodetect separatore (, o ;) + BOM."""
     if not path.exists():
         raise FileNotFoundError(f"File non trovato: {path}")
 
@@ -74,7 +75,7 @@ def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
     out["date"] = df[date_col]
     out["value"] = df[value_col]
 
-    # Date: dayfirst=True evita ambiguità stile italiano
+    # Date: dayfirst=True (stile italiano)
     out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
 
     # Value: gestisce virgole decimali
@@ -95,6 +96,8 @@ def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
     return s
 
 
+# ------------------ Frequency / resample ------------------
+
 def _freq_to_pandas(freq: str) -> str:
     f = (freq or "monthly").strip().lower()
     return {
@@ -102,7 +105,7 @@ def _freq_to_pandas(freq: str) -> str:
         "d": "D",
         "weekly": "W-FRI",
         "w": "W-FRI",
-        "monthly": "ME",   # importante: 'M' in pandas recenti può dare problemi
+        "monthly": "ME",   # pandas recente
         "m": "ME",
         "quarterly": "QE",
         "q": "QE",
@@ -125,6 +128,8 @@ def _normalize_100(s: pd.Series) -> pd.Series:
     return (s / base) * 100.0
 
 
+# ------------------ Data access ------------------
+
 def _read_asset(asset: str) -> pd.Series:
     asset = asset.strip().lower()
     if asset not in ASSET_FILES:
@@ -140,16 +145,22 @@ def _series_to_payload(asset: str, s: pd.Series, freq: str) -> dict:
     labels = [d.strftime("%Y-%m") for d in s.index.to_pydatetime()]
     values = [round(float(v), 4) for v in s.values]
     base_date = s.index[0].strftime("%Y-%m-%d") if not s.empty else None
-    return {"asset": asset, "base_date": base_date, "freq": freq, "points": len(values), "labels": labels, "values": values}
+    return {
+        "asset": asset,
+        "base_date": base_date,
+        "freq": freq,
+        "points": len(values),
+        "labels": labels,
+        "values": values,
+    }
 
+
+# ------------------ Routes ------------------
 
 @app.get("/")
-def home():
-    # apre la pagina con grafici
-    index_file = STATIC_DIR / "index.html"
-    if index_file.exists():
-        return send_from_directory(STATIC_DIR, "index.html")
-    return "OK - manca static/index.html", 200
+def index():
+    # usa templates/index.html (come nella tua struttura)
+    return render_template("index.html")
 
 
 @app.get("/api/data")
