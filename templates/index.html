@@ -2,94 +2,73 @@
 <html lang="it">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Gloob — Test grafici (Chart.js)</title>
-
-  <!-- Chart.js (prima di app.js) -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gloob minimal charts</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body{
-      font-family: system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Oxygen,Ubuntu,Cantarell,"Helvetica Neue",Arial,sans-serif;
-      background:#f6f7f9;
-      margin:0;
-      padding:32px;
-      color:#111;
-    }
-    h1{ margin:0 0 8px; font-size:42px; letter-spacing:-0.5px; }
-    #status{ color:#666; margin:0 0 16px; }
-
-    .controls{
-      display:flex; gap:10px; flex-wrap:wrap;
-      margin: 12px 0 18px;
-    }
-    .btn{
-      border:1px solid #ddd;
-      background:#fff;
-      padding:8px 12px;
-      border-radius:8px;
-      cursor:pointer;
-      font-size:14px;
-    }
-    .btn:hover{ background:#f2f2f2; }
-
-    .panel{
-      width:100%;
-      max-width:1100px;
-      background:#fff;
-      border-radius:12px;
-      padding:14px 14px 10px;
-      box-shadow:0 2px 8px rgba(0,0,0,0.06);
-      margin-bottom:18px;
-    }
-    .panel h2{
-      margin:0 0 8px;
-      font-size:16px;
-      font-weight:700;
-      color:#222;
-    }
-    .note{
-      margin: 0 0 10px;
-      color:#666;
-      font-size:13px;
-    }
-
-    .chartWrap{
-      height:420px;
-    }
-    canvas{ width:100% !important; height:100% !important; }
+    body { font-family: system-ui, Arial; margin: 20px; }
+    .row { display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+    canvas { max-width: 1100px; }
   </style>
 </head>
-
 <body>
-  <h1>Gloob — Test grafici (Chart.js)</h1>
-  <p id="status">Carico i dati…</p>
+  <h2>Portafoglio vs Benchmark (LS80)</h2>
 
-  <div class="controls">
-    <button class="btn" data-freq="daily">Giornaliero</button>
-    <button class="btn" data-freq="weekly">Settimanale</button>
-    <button class="btn" data-freq="monthly">Mensile</button>
+  <div class="row">
+    <label>Frequenza:</label>
+    <select id="freq">
+      <option value="monthly" selected>Mensile</option>
+      <option value="weekly">Settimanale</option>
+      <option value="daily">Giornaliera</option>
+    </select>
+    <button id="reload">Aggiorna</button>
+    <span id="info"></span>
   </div>
 
-  <!-- Grafico B -->
-  <div class="panel">
-    <h2>Grafico B — Portafoglio (base 100)</h2>
-    <p class="note" id="noteB"></p>
-    <div class="chartWrap">
-      <canvas id="chartB"></canvas>
-    </div>
-  </div>
+  <p></p>
+  <canvas id="chart" height="120"></canvas>
 
-  <!-- Grafico C -->
-  <div class="panel">
-    <h2>Grafico C — LS80 (base 100)</h2>
-    <p class="note" id="noteC"></p>
-    <div class="chartWrap">
-      <canvas id="chartC"></canvas>
-    </div>
-  </div>
+  <script>
+    let chart;
 
-  <!-- Il tuo JS -->
-  <script src="/static/app.js" defer></script>
+    async function load() {
+      const freq = document.getElementById("freq").value;
+      const res = await fetch(`/api/combined?freq=${encodeURIComponent(freq)}`);
+      const data = await res.json();
+
+      if (data.error) {
+        document.getElementById("info").textContent = "ERRORE: " + data.error;
+        return;
+      }
+
+      document.getElementById("info").textContent =
+        `Base: ${data.base_date} • Punti: ${data.points}`;
+
+      const ctx = document.getElementById("chart").getContext("2d");
+
+      const cfg = {
+        type: "line",
+        data: {
+          labels: data.labels,
+          datasets: [
+            { label: "Benchmark (LS80)", data: data.series.benchmark, tension: 0.2 },
+            { label: "Portafoglio", data: data.series.portfolio, tension: 0.2 }
+          ]
+        },
+        options: {
+          responsive: true,
+          interaction: { mode: "index", intersect: false },
+          plugins: { legend: { position: "top" } },
+          scales: { y: { ticks: { callback: (v)=> v.toFixed(0) } } }
+        }
+      };
+
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, cfg);
+    }
+
+    document.getElementById("reload").addEventListener("click", load);
+    load();
+  </script>
 </body>
 </html>
