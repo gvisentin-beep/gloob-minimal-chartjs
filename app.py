@@ -1,156 +1,197 @@
+from __future__ import annotations
+
 import os
 from pathlib import Path
+from typing import Dict, Tuple
 
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
+STATIC_DIR = BASE_DIR / "static"
 
-ASSETS = {
+ASSET_FILES: Dict[str, str] = {
     "ls80": "ls80.csv",
     "gold": "gold.csv",
     "btc": "btc.csv",
 }
 
-# pesi portafoglio
+# Pesi portafoglio
 W_LS80 = 0.80
 W_GOLD = 0.15
 W_BTC = 0.05
 
 
-# -------------------------------------------------------------------
-# UTILITIES
-# -------------------------------------------------------------------
-
-def read_asset(asset: str) -> pd.Series:
-    asset = asset.lower()
-    if asset not in ASSETS:
-        raise ValueError(f"Asset non supportato: {asset}")
-
-    path = DATA_DIR / ASSETS[asset]
+def _detect_and_read_csv(path: Path) -> pd.DataFrame:
+    """Legge CSV auto-detectando separatore (, o ;) e gestendo BOM/righe vuote."""
     if not path.exists():
-        raise FileNotFoundError(f"File mancante: {path}")
+        raise FileNotFoundError(f"File non trovato: {path}")
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(
+        path,
+        sep=None,               # autodetect
+        engine="python",
+        encoding="utf-8-sig",
+        skip_blank_lines=True,
+    )
+    if df is None or df.empty:
+        raise ValueError(f"CSV vuoto o illeggibile: {path.name}")
+    return df
 
-    if df.shape[1] < 2:
-        raise ValueError(f"CSV {asset} deve avere almeno 2 colonne")
 
-    df = df.iloc[:, :2]
-    df.columns = ["date", "value"]
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
-    df["value"] = (
-        df["value"]
+
+def _pick_date_value_columns(df: pd.DataFrame) -> Tuple[str, str]:
+    """Trova colonne data/valore; se non le trova usa le prime 2."""
+    cols = list(df.columns)
+
+    date_candidates = {"date", "data", "datetime", "timestamp"}
+    value_candidates = {"value", "valore", "close", "prezzo", "price", "adj close", "adj_close", "last"}
+
+    date_col = next((c for c in cols if c in date_candidates), None)
+    value_col = next((c for c in cols if c in value_candidates), None)
+
+    if date_col and value_col:
+        return date_col, value_col
+
+    if len(cols) < 2:
+        raise ValueError("Il CSV deve avere almeno 2 colonne (data, valore).")
+    return cols[0], cols[1]
+
+
+def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
+    df = _normalize_columns(df)
+    date_col, value_col = _pick_date_value_columns(df)
+
+    out = pd.DataFrame()
+    out["date"] = df[date_col]
+    out["value"] = df[value_col]
+
+    # Date: dayfirst=True evita ambiguità stile italiano
+    out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
+
+    # Value: gestisce virgole decimali
+    out["value"] = (
+        out["value"]
         .astype(str)
+        .str.replace(" ", "", regex=False)
         .str.replace(",", ".", regex=False)
     )
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
 
-    df = df.dropna().sort_values("date")
+    out = out.dropna(subset=["date", "value"]).sort_values("date")
+    if out.empty:
+        raise ValueError(f"CSV {asset} non contiene righe valide (data/valore).")
 
-    if df.empty:
-        raise ValueError(f"CSV {asset} senza dati validi")
-
-    s = df.set_index("date")["value"]
+    s = out.set_index("date")["value"].astype(float)
     s = s[~s.index.duplicated(keep="last")]
-
     return s
 
 
-def resample_series(s: pd.Series, freq: str) -> pd.Series:
-    freq = (freq or "monthly").lower()
+def _freq_to_pandas(freq: str) -> str:
+    f = (freq or "monthly").strip().lower()
+    return {
+        "daily": "D",
+        "d": "D",
+        "weekly": "W-FRI",
+        "w": "W-FRI",
+        "monthly": "ME",   # importante: 'M' in pandas recenti può dare problemi
+        "m": "ME",
+        "quarterly": "QE",
+        "q": "QE",
+        "yearly": "YE",
+        "y": "YE",
+    }.get(f, "ME")
 
-    if freq in ("monthly", "m"):
-        rule = "ME"
-    elif freq in ("yearly", "y"):
-        rule = "YE"
-    else:
-        rule = "ME"
 
+def _resample(s: pd.Series, freq: str) -> pd.Series:
+    rule = _freq_to_pandas(freq)
     return s.resample(rule).last().dropna()
 
 
-def normalize_100(s: pd.Series) -> pd.Series:
-    base = s.iloc[0]
-    return (s / base) * 100
+def _normalize_100(s: pd.Series) -> pd.Series:
+    if s.empty:
+        return s
+    base = float(s.iloc[0])
+    if base == 0:
+        return s
+    return (s / base) * 100.0
 
 
-# -------------------------------------------------------------------
-# ROUTES
-# -------------------------------------------------------------------
+def _read_asset(asset: str) -> pd.Series:
+    asset = asset.strip().lower()
+    if asset not in ASSET_FILES:
+        raise ValueError(f"Asset non supportato: {asset}. Disponibili: {list(ASSET_FILES.keys())}")
 
-@app.route("/")
+    path = DATA_DIR / ASSET_FILES[asset]
+    df = _detect_and_read_csv(path)
+    return _to_series(df, asset)
+
+
+def _series_to_payload(asset: str, s: pd.Series, freq: str) -> dict:
+    s = _normalize_100(_resample(s, freq))
+    labels = [d.strftime("%Y-%m") for d in s.index.to_pydatetime()]
+    values = [round(float(v), 4) for v in s.values]
+    base_date = s.index[0].strftime("%Y-%m-%d") if not s.empty else None
+    return {"asset": asset, "base_date": base_date, "freq": freq, "points": len(values), "labels": labels, "values": values}
+
+
+@app.get("/")
 def home():
-    return "OK – servizio attivo", 200
+    # apre la pagina con grafici
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return send_from_directory(STATIC_DIR, "index.html")
+    return "OK - manca static/index.html", 200
 
 
-@app.route("/api/data")
+@app.get("/api/data")
 def api_data():
+    asset = request.args.get("asset", "ls80")
+    freq = request.args.get("freq", "monthly")
     try:
-        asset = request.args.get("asset", "ls80")
-        freq = request.args.get("freq", "monthly")
-
-        s = read_asset(asset)
-        s = resample_series(s, freq)
-        s = normalize_100(s)
-
-        return jsonify({
-            "asset": asset,
-            "base_date": s.index[0].strftime("%Y-%m-%d"),
-            "freq": freq,
-            "labels": [d.strftime("%Y-%m") for d in s.index],
-            "points": len(s),
-            "values": [round(float(v), 4) for v in s.values],
-        })
-
+        s = _read_asset(asset)
+        return jsonify(_series_to_payload(asset, s, freq))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/combined")
+@app.get("/api/combined")
 def api_combined():
+    freq = request.args.get("freq", "monthly")
     try:
-        freq = request.args.get("freq", "monthly")
+        ls80 = _normalize_100(_resample(_read_asset("ls80"), freq))
+        gold = _normalize_100(_resample(_read_asset("gold"), freq))
+        btc = _normalize_100(_resample(_read_asset("btc"), freq))
 
-        ls80 = normalize_100(resample_series(read_asset("ls80"), freq))
-        gold = normalize_100(resample_series(read_asset("gold"), freq))
-        btc = normalize_100(resample_series(read_asset("btc"), freq))
-
-        df = pd.concat(
-            {"ls80": ls80, "gold": gold, "btc": btc},
-            axis=1
-        ).dropna()
-
+        df = pd.concat({"ls80": ls80, "gold": gold, "btc": btc}, axis=1).dropna()
         if df.empty:
-            raise ValueError("Date non allineabili tra gli asset")
+            raise ValueError("Dopo allineamento date comuni, non ci sono dati sufficienti.")
 
-        portfolio = (
-            df["ls80"] * W_LS80 +
-            df["gold"] * W_GOLD +
-            df["btc"] * W_BTC
-        )
+        portfolio = (df["ls80"] * W_LS80) + (df["gold"] * W_GOLD) + (df["btc"] * W_BTC)
+        labels = [d.strftime("%Y-%m") for d in df.index.to_pydatetime()]
 
         return jsonify({
             "base_date": df.index[0].strftime("%Y-%m-%d"),
             "freq": freq,
-            "labels": [d.strftime("%Y-%m") for d in df.index],
-            "points": int(len(df)),
+            "labels": labels,
+            "points": int(df.shape[0]),
             "series": {
                 "benchmark": [round(float(v), 4) for v in df["ls80"].values],
                 "portfolio": [round(float(v), 4) for v in portfolio.values],
-            }
+            },
         })
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# -------------------------------------------------------------------
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
