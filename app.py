@@ -18,26 +18,15 @@ ASSET_FILES: Dict[str, str] = {
     "btc": "btc.csv",
 }
 
-# Pesi portafoglio
 W_LS80 = 0.80
 W_GOLD = 0.15
 W_BTC = 0.05
 
 
-# ------------------ CSV helpers ------------------
-
 def _detect_and_read_csv(path: Path) -> pd.DataFrame:
-    """Legge CSV con autodetect separatore (, o ;) + BOM."""
     if not path.exists():
         raise FileNotFoundError(f"File non trovato: {path}")
-
-    df = pd.read_csv(
-        path,
-        sep=None,               # autodetect
-        engine="python",
-        encoding="utf-8-sig",
-        skip_blank_lines=True,
-    )
+    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig", skip_blank_lines=True)
     if df is None or df.empty:
         raise ValueError(f"CSV vuoto o illeggibile: {path.name}")
     return df
@@ -50,9 +39,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _pick_date_value_columns(df: pd.DataFrame) -> Tuple[str, str]:
-    """Trova colonne data/valore; se non le trova usa le prime 2."""
     cols = list(df.columns)
-
     date_candidates = {"date", "data", "datetime", "timestamp"}
     value_candidates = {"value", "valore", "close", "prezzo", "price", "adj close", "adj_close", "last"}
 
@@ -75,10 +62,8 @@ def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
     out["date"] = df[date_col]
     out["value"] = df[value_col]
 
-    # Date: dayfirst=True (stile italiano)
     out["date"] = pd.to_datetime(out["date"], errors="coerce", dayfirst=True)
 
-    # Value: gestisce virgole decimali
     out["value"] = (
         out["value"]
         .astype(str)
@@ -96,27 +81,19 @@ def _to_series(df: pd.DataFrame, asset: str) -> pd.Series:
     return s
 
 
-# ------------------ Frequency / resample ------------------
-
 def _freq_to_pandas(freq: str) -> str:
     f = (freq or "monthly").strip().lower()
     return {
-        "daily": "D",
-        "d": "D",
-        "weekly": "W-FRI",
-        "w": "W-FRI",
-        "monthly": "ME",   # pandas recente
-        "m": "ME",
-        "quarterly": "QE",
-        "q": "QE",
-        "yearly": "YE",
-        "y": "YE",
+        "daily": "D", "d": "D",
+        "weekly": "W-FRI", "w": "W-FRI",
+        "monthly": "ME", "m": "ME",
+        "quarterly": "QE", "q": "QE",
+        "yearly": "YE", "y": "YE",
     }.get(f, "ME")
 
 
 def _resample(s: pd.Series, freq: str) -> pd.Series:
-    rule = _freq_to_pandas(freq)
-    return s.resample(rule).last().dropna()
+    return s.resample(_freq_to_pandas(freq)).last().dropna()
 
 
 def _normalize_100(s: pd.Series) -> pd.Series:
@@ -128,13 +105,10 @@ def _normalize_100(s: pd.Series) -> pd.Series:
     return (s / base) * 100.0
 
 
-# ------------------ Data access ------------------
-
 def _read_asset(asset: str) -> pd.Series:
     asset = asset.strip().lower()
     if asset not in ASSET_FILES:
         raise ValueError(f"Asset non supportato: {asset}. Disponibili: {list(ASSET_FILES.keys())}")
-
     path = DATA_DIR / ASSET_FILES[asset]
     df = _detect_and_read_csv(path)
     return _to_series(df, asset)
@@ -144,10 +118,9 @@ def _series_to_payload(asset: str, s: pd.Series, freq: str) -> dict:
     s = _normalize_100(_resample(s, freq))
     labels = [d.strftime("%Y-%m") for d in s.index.to_pydatetime()]
     values = [round(float(v), 4) for v in s.values]
-    base_date = s.index[0].strftime("%Y-%m-%d") if not s.empty else None
     return {
         "asset": asset,
-        "base_date": base_date,
+        "base_date": s.index[0].strftime("%Y-%m-%d") if not s.empty else None,
         "freq": freq,
         "points": len(values),
         "labels": labels,
@@ -155,11 +128,9 @@ def _series_to_payload(asset: str, s: pd.Series, freq: str) -> dict:
     }
 
 
-# ------------------ Routes ------------------
-
 @app.get("/")
 def index():
-    # usa templates/index.html (come nella tua struttura)
+    # Homepage: templates/index.html
     return render_template("index.html")
 
 
